@@ -1,0 +1,26 @@
+# Ignore data and model files
+*.npz
+*.h5
+*.keras
+*.onnx
+*.json
+*.ckpt
+*.pb
+*.pth
+
+# Ignore folders with data
+data/
+
+# Ignore Python cache and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+env/
+eye-env/
+.tfgpu-env/
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
