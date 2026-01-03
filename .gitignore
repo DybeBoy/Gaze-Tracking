@@ -10,6 +10,8 @@
 
 # Ignore folders with data
 data/
+data copy/
+saved models/
 
 # Ignore Python cache and virtual environments
 __pycache__/

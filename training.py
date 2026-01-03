@@ -1,103 +1,182 @@
 import torch
-from torch import nn
+import torch.nn as nn
 from torch.utils.data import DataLoader
-from torchvision import datasets
-from torchvision.transforms import ToTensor
-import torchvision.models as models
+from torchvision import transforms
+from library import *
+import torch.optim as optim
+import os
+from pathlib import Path
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# ---Setting---
 
-learning_rate = 1e-3
-batch_size = 64
-epochs = 30
+# Main
+BATCH_SIZE = 32
+EPOCHS = 50
+FREEZE_EPICHS = 20
+LR = 1e-3
 
-training_data = datasets.FashionMNIST(
-    root="data",
-    train=True,
-    download=True,
-    transform=ToTensor()
-)
+# Scheduler
+SC_FACTOR = 0.5
+SC_PATIENCE = 5
+MIN_LR = 1e-6
 
-test_data = datasets.FashionMNIST(
-    root="data",
-    train=False,
-    download=True,
-    transform=ToTensor()
-)
+# Early stop
+ES_PATIENCE = 10
 
-train_dataloader = DataLoader(training_data, batch_size=batch_size)
-test_dataloader = DataLoader(test_data, batch_size=batch_size)
 
-class NeuralNetwork(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.flatten = nn.Flatten()
-        self.linear_relu_stack = nn.Sequential(
-            nn.Linear(28*28, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 10),
+def main():
+    #try:
+        torch.backends.cudnn.benchmark = True
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
+
+        model = NeuralNetworkModel().to(device)
+
+        transform = transforms.Compose([
+            transforms.Resize((96, 96)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+
+        train_dataset = GazeDataset(
+            root="data/training", 
+            transform=transform
         )
 
-    def forward(self, x):
-        x = self.flatten(x)
-        logits = self.linear_relu_stack(x)
-        return logits
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            num_workers=8,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2
+        )
 
-model = NeuralNetwork()
-#model = torch.load('model.pth', weights_only=False)
-model.to(device)
+        val_dataset = GazeDataset(
+            root="data/validation",
+            transform=transform
+        )
 
-def train_loop(dataloader, model, loss_fn, optimizer):
-    size = len(dataloader.dataset)
-    # Set the model to training mode - important for batch normalization and dropout layers
-    # Unnecessary in this situation but added for best practices
-    model.train()
-    for batch, (X, y) in enumerate(dataloader):
-        X, y = X.to(device), y.to(device)
-        # Compute prediction and loss
-        pred = model(X)
-        loss = loss_fn(pred, y)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2
+        )
 
-        # Backpropagation
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+        criterion = nn.SmoothL1Loss(beta=0.05)
+        optimizer = optim.Adam(
+            model.parameters(), 
+            lr=LR,
+            weight_decay=1e-4
+        )
+        scaler = torch.amp.GradScaler()
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=SC_FACTOR,
+            patience=SC_PATIENCE,
+            min_lr=MIN_LR,
+        )
 
-        if batch % 100 == 0:
-            loss, current = loss.item(), batch * batch_size + len(X)
-            print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+        best_val_loss = float("inf")
+        early_stop_counter = 0
+        early_stop_patience = ES_PATIENCE
 
+        model.freeze_backbone(freeze=True)
 
-def test_loop(dataloader, model, loss_fn):
-    # Set the model to evaluation mode - important for batch normalization and dropout layers
-    # Unnecessary in this situation but added for best practices
-    model.eval()
-    size = len(dataloader.dataset)
-    num_batches = len(dataloader)
-    test_loss, correct = 0, 0
+        for epoch in range(EPOCHS):
+            if epoch == FREEZE_EPICHS:
+                model.freeze_backbone(freeze=False)
+                print("Unfroze backbone for fine-tuning.")
 
-    # Evaluating the model with torch.no_grad() ensures that no gradients are computed during test mode
-    # also serves to reduce unnecessary gradient computations and memory usage for tensors with requires_grad=True
-    with torch.no_grad():
-        for X, y in dataloader:
-            X, y = X.to(device), y.to(device)
-            pred = model(X)
-            test_loss += loss_fn(pred, y).item()
-            correct += (pred.argmax(1) == y).type(torch.float).sum().item()
+            model.train()
+            train_loss = 0.0
 
-    test_loss /= num_batches
-    correct /= size
-    print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
+            for images, head_rotations, head_positions, head_depths, labels in train_loader:
+                images = images.to(device) # (batch_size, 3, 96, 96)
+                head_rotations = head_rotations.to(device) # (batch_size, 3)
+                head_positions = head_positions.to(device) #(batch_size, 2)
+                head_depths = head_depths.to(device) # (batch_size, 1)
+                head_input = torch.cat([head_rotations, head_positions, head_depths], dim=1) # (batch_size, 6)
+                labels = labels.to(device)
 
-loss_fn = nn.CrossEntropyLoss()
-optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+                with torch.amp.autocast(device_type=device.type):
+                    outputs = model(images, head_input)
+                    loss = criterion(outputs, labels)
 
-for epoch in range(epochs):
-    print(f"Epoch {epoch+1}\n-------------------------------")
-    train_loop(train_dataloader, model, loss_fn, optimizer)
-    test_loop(test_dataloader, model, loss_fn)
-print("Done!")
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
-torch.save(model, "model.pth")
+                train_loss += loss.item()
+
+            train_loss /= len(train_loader)
+
+            model.eval()
+            val_loss = 0.0
+
+            with torch.no_grad():
+                for images, head_rotations, head_positions, head_depths, labels in val_loader:
+                    images = images.to(device)
+                    head_rotations = head_rotations.to(device)
+                    head_positions = head_positions.to(device) 
+                    head_depths = head_depths.to(device)
+                    head_input = torch.cat([head_rotations, head_positions, head_depths], dim=1) # (batch_size, 6)
+                    labels = labels.to(device)
+
+                    with torch.amp.autocast(device_type=device.type):
+                        outputs = model(images, head_input)
+                        loss = criterion(outputs, labels)
+
+                    val_loss += loss.item()
+
+            val_loss /= len(val_loader)
+
+            scheduler.step(val_loss)
+
+            print(
+                f"Epoch {epoch+1}/{EPOCHS}: "
+                f"  Train Loss: {train_loss:.6f} "
+                f"  Val Loss: {val_loss:.6f} "
+                f"  LR: {optimizer.param_groups[0]['lr']:.2e} "
+            )
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                early_stop_counter = 0
+                torch.save(model.state_dict(), "best_gaze_model.pth")
+                print("Saved best model.")
+            else:
+                early_stop_counter += 1
+
+            if early_stop_counter >= early_stop_patience:
+                print("Early stopping triggered.")
+                break
+
+    #except KeyboardInterrupt:
+        #print("Stopping")
+    
+    #finally:
+    #    # save best model in model folder
+    #    os.makedirs("saved models", exist_ok=True)
+    #    model_idx = os.listdir("saved models")
+        #torch.save(model.state_dict(), f"saved models/gaze_model{len(model_idx)}.pth")
+
+    #    src = Path(r"d:\PythonProjektit\Gaze-Tracking-\best_gaze_model.pth")
+    #    dst = f"d:\PythonProjektit\Gaze-Tracking-\saved models\gaze_model{len(model_idx)}.pth"
+    #    dst = Path(dst)
+
+    #    os.replace(src, dst)
+
+if __name__ == "__main__":
+    main()
