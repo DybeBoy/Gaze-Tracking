@@ -43,8 +43,8 @@ model.load_state_dict(torch.load(f"saved models/gaze_model{model_num}.pth", map_
 model.eval()
 
 # Screen size
-w, h = pyautogui.size()
-screen = np.zeros((h, w, 3), dtype=np.uint8)
+width, height = pyautogui.size()
+screen = np.zeros((height, width, 3), dtype=np.uint8)
 
 # Setup Mediapipe
 mp_face = mp.solutions.face_mesh
@@ -56,33 +56,113 @@ cap = cv2.VideoCapture(0)
 cv2.namedWindow("Gaze Detection", cv2.WND_PROP_FULLSCREEN)
 cv2.setWindowProperty("Gaze Detection", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
+calib_points = [
+    (-0.8, -0.8),   (0, -0.8),   (0.8, -0.8),
+    (-0.8,  0  ),   (0,  0  ),   (0.8,  0  ),
+    (-0.8,  0.8),   (0,  0.8),   (0.8,  0.8),
+]
+
+preds = []
+targets = []
+
+is_continuous = False
+last_capture_time = 0.0
+capture_interval = 0.12
+
+for (nx, ny) in calib_points:
+    px, py = int((nx / 2 + 0.5) * width), int((ny / 2 + 0.5) * height)
+
+    images = 0
+
+    while True:
+        now = time.time()
+
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        res = face_mesh.process(rgb)
+
+        screen[:] = (0, 0, 0)
+        cv2.circle(screen, (px, py), 15, (0, 255, 0), -1)
+        cv2.imshow("Gaze Detection", screen)
+
+        key = cv2.waitKey(1)
+        if key == 27:
+            cap.release()
+            cv2.destroyAllWindows()
+            exit()
+        if key in [ord('c'), ord('C')]:
+            is_continuous = not is_continuous
+            last_capture_time = 0.0
+            print(f"Continuous capture: {is_continuous}")
+            continue
+        if key == 32 and res.multi_face_landmarks:
+                force_single = True
+        else:
+            force_single = False
+
+        do_capture = False
+        if force_single:
+            do_capture = True
+        elif is_continuous and (now - last_capture_time) >= capture_interval:
+            do_capture = True
+
+        if not do_capture:
+            continue
+
+        last_capture_time = now
+
+        landmarks = res.multi_face_landmarks[0].landmark
+        pred = gaze_prediction(model, frame, device, face_mesh)
+
+        preds.append([pred["x"], pred["y"]])
+        targets.append([nx, ny])
+
+        images += 1
+
+        if images >= 50:
+            is_continuous = False
+            images = 0
+            print("changing")
+            break
+
+x = np.hstack([preds, np.ones((len(preds), 1))])
+y = np.array(targets)
+
+w, _, _, _ = np.linalg.lstsq(x, y, rcond=None)
+
 frame_delay = 1.0 / 10 # Target 10 FPS
 last_frame_time = time.time()
 
-while True:
-    current_time = time.time()
-    if current_time - last_frame_time < frame_delay:
-        continue
-    last_frame_time = current_time
+try:
+    while True:
+        current_time = time.time()
+        elapsed = current_time - last_frame_time
+        if elapsed < frame_delay:
+            time.sleep(frame_delay - elapsed)
+        last_frame_time = time.time()
 
-    ret, frame = cap.read()
-    if not ret:
-        continue
-    
-    gaze_data = gaze_prediction(model, frame, device)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        
+        gaze_data = gaze_prediction(model, frame, device, face_mesh)
 
-    if gaze_data == None:
-        continue
+        if gaze_data is None:
+            continue
 
-    posX, posY = int(clamp01(gaze_data["x"]) * w), int(clamp01(gaze_data["y"]) * h)
+        posX, posY = np.array([gaze_data["x"], gaze_data["y"], 1.0]) @ w
+        posX, posY = int(clamp01((posX) / 2 + 0.5) * width), int(clamp01((posY) / 2 + 0.5) * height)
 
-    screen[:] = (0, 0, 0)
-    cv2.circle(screen, (posX, posY), 15, (255, 0, 0), -1)
-    cv2.imshow("Gaze Detection", screen)
-    print(posX/w, posY/h)
-
-    if cv2.waitKey(1) == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+        screen[:] = (0, 0, 0)
+        cv2.circle(screen, (posX, posY), 15, (255, 0, 0), -1)
+        cv2.imshow("Gaze Detection", screen)
+        
+        if cv2.waitKey(1) == 27:
+            break
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    face_mesh.close()

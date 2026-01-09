@@ -5,27 +5,26 @@ from torchvision import transforms
 from library import *
 import torch.optim as optim
 import os
-from pathlib import Path
 
 # ---Setting---
 
 # Main
-BATCH_SIZE = 32
-EPOCHS = 50
+BATCH_SIZE = 64
+EPOCHS = 200
 FREEZE_EPICHS = 20
 LR = 1e-3
 
 # Scheduler
 SC_FACTOR = 0.5
-SC_PATIENCE = 5
+SC_PATIENCE = 8
 MIN_LR = 1e-6
 
 # Early stop
-ES_PATIENCE = 10
+ES_PATIENCE = 15
 
 
 def main():
-    #try:
+    try:
         torch.backends.cudnn.benchmark = True
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -42,6 +41,7 @@ def main():
             )
         ])
 
+        print("\nTraining")
         train_dataset = GazeDataset(
             root="data/training", 
             transform=transform
@@ -57,10 +57,12 @@ def main():
             prefetch_factor=2
         )
 
+        print("\nValidation")
         val_dataset = GazeDataset(
             root="data/validation",
             transform=transform
         )
+        print("\n")
 
         val_loader = DataLoader(
             val_dataset,
@@ -96,17 +98,18 @@ def main():
         for epoch in range(EPOCHS):
             if epoch == FREEZE_EPICHS:
                 model.freeze_backbone(freeze=False)
+
                 print("Unfroze backbone for fine-tuning.")
 
             model.train()
             train_loss = 0.0
 
-            for images, head_rotations, head_positions, head_depths, labels in train_loader:
+            for images, head_rotations, head_positions, labels in train_loader:
                 images = images.to(device) # (batch_size, 3, 96, 96)
                 head_rotations = head_rotations.to(device) # (batch_size, 3)
                 head_positions = head_positions.to(device) #(batch_size, 2)
-                head_depths = head_depths.to(device) # (batch_size, 1)
-                head_input = torch.cat([head_rotations, head_positions, head_depths], dim=1) # (batch_size, 6)
+                #head_depths = head_depths.to(device) # (batch_size, 1)
+                head_input = torch.cat([head_rotations, head_positions], dim=1) # (batch_size, 6)
                 labels = labels.to(device)
 
                 with torch.amp.autocast(device_type=device.type):
@@ -126,12 +129,12 @@ def main():
             val_loss = 0.0
 
             with torch.no_grad():
-                for images, head_rotations, head_positions, head_depths, labels in val_loader:
+                for images, head_rotations, head_positions, labels in val_loader:
                     images = images.to(device)
                     head_rotations = head_rotations.to(device)
                     head_positions = head_positions.to(device) 
-                    head_depths = head_depths.to(device)
-                    head_input = torch.cat([head_rotations, head_positions, head_depths], dim=1) # (batch_size, 6)
+                    #head_depths = head_depths.to(device)
+                    head_input = torch.cat([head_rotations, head_positions], dim=1) # (batch_size, 6)
                     labels = labels.to(device)
 
                     with torch.amp.autocast(device_type=device.type):
@@ -163,20 +166,15 @@ def main():
                 print("Early stopping triggered.")
                 break
 
-    #except KeyboardInterrupt:
-        #print("Stopping")
+    except KeyboardInterrupt:
+        print("Stopping")
     
-    #finally:
-    #    # save best model in model folder
-    #    os.makedirs("saved models", exist_ok=True)
-    #    model_idx = os.listdir("saved models")
-        #torch.save(model.state_dict(), f"saved models/gaze_model{len(model_idx)}.pth")
-
-    #    src = Path(r"d:\PythonProjektit\Gaze-Tracking-\best_gaze_model.pth")
-    #    dst = f"d:\PythonProjektit\Gaze-Tracking-\saved models\gaze_model{len(model_idx)}.pth"
-    #    dst = Path(dst)
-
-    #    os.replace(src, dst)
+    finally:
+        # save best model in model folder
+        os.makedirs("saved models", exist_ok=True)
+        model_idx = os.listdir("saved models")
+        torch.save(torch.load("best_gaze_model.pth"), f"saved models/gaze_model{len(model_idx)}.pth")
+        print(f"{best_val_loss:.6f}")
 
 if __name__ == "__main__":
     main()

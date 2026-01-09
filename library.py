@@ -127,39 +127,50 @@ def get_head_depth(res, frame):
 
     return np.array([iod_px], dtype=np.float32)
 
-def gaze_prediction(model, frame, device):
+# Reusable inference transform to avoid recreating it every frame
+infer_transform = transforms.Compose([
+    transforms.Resize((96, 96)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+
+def gaze_prediction(model, frame, device, face_mesh=None):
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
-    mp_face = mp.solutions.face_mesh
-    face_mesh = mp_face.FaceMesh(refine_landmarks=True)
+
+    created_local = False
+    if face_mesh is None:
+        mp_face = mp.solutions.face_mesh
+        face_mesh = mp_face.FaceMesh(refine_landmarks=True)
+        created_local = True
 
     res = face_mesh.process(rgb_frame)
 
-    if not res.multi_face_landmarks: 
+    if not res.multi_face_landmarks:
+        if created_local:
+            face_mesh.close()
         return None
 
     eye_data = get_eye_input_data(res, frame)
     if eye_data is None:
+        if created_local:
+            face_mesh.close()
         return None
     
     head_rot = get_head_rotations(res, frame)
     if head_rot is None:
+        if created_local:
+            face_mesh.close()
         return None
     
     head_pos = get_head_position(res)
 
     head_depth = get_head_depth(res, frame)
 
-    head_input = np.concatenate([head_rot, head_pos, head_depth]).astype(np.float32)
-
-    infer_transform = transforms.Compose([
-        transforms.Resize((96, 96)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-    ])
+    head_input = np.concatenate([head_rot, head_pos]).astype(np.float32)
 
     # Convert OpenCV BGR numpy array to PIL RGB image for torchvision transforms
     eye_pil = Image.fromarray(cv2.cvtColor(eye_data, cv2.COLOR_BGR2RGB))
@@ -171,6 +182,10 @@ def gaze_prediction(model, frame, device):
         prediction = model(eye_tensor, head_input_tensor)
 
     gaze = prediction.cpu().numpy()
+
+    if created_local:
+        face_mesh.close()
+
     return {
         "x": gaze[0][0],
         "y": gaze[0][1]
@@ -255,27 +270,29 @@ class GazeDataset(Dataset):
 
     def __getitem__(self, idx):
         img_folder_name, space, image_id = str.partition(self.image_ids[idx], "_")
-        img_path = f"{self.root}/{img_folder_name}/images/{image_id}" # tää paska on rikki vittu korjaa se ples kun ei oo sitä straight hommaa imagen eess
+        img_path = f"{self.root}/{img_folder_name}/images/{image_id}"
         image = Image.open(img_path).convert("RGB") 
 
         if self.transform:
             image = self.transform(image)
 
-        HEAD_SCALE = 0.25
+        HEAD_SCALE = 0.5
 
         head_rot = torch.tensor(self.head_rots[idx], dtype=torch.float32) * HEAD_SCALE
         head_pos = torch.tensor(self.head_pos[idx], dtype=torch.float32) * HEAD_SCALE
         head_depth = torch.tensor(self.head_depths[idx], dtype=torch.float32) * HEAD_SCALE
         label = torch.tensor(self.labels[idx], dtype=torch.float32)
 
-        return image, head_rot, head_pos, head_depth, label
+        return image, head_rot, head_pos, label
 
     def save_item(self, img, head_rot, head_pos, head_depth, label):
-        last_root_folder = str.partition(self.root, "/")[2]
+        new_root = str.partition(self.root, "/")[2]
+        last_root_folder = str.partition(new_root, "/")[2]
+        img_name = f"{len(self.image_ids):07d}.png"
         img_id = f"{last_root_folder}_{len(self.image_ids):07d}.png"
-        cv2.imwrite(f"{self.root}/images/{img_id}", img)
-
-        self.image_ids = np.append(self.image_ids, img_id) # laita tähän se folderin nimi niin nimet eri ja pystyy ettii paremmin :)
+        cv2.imwrite(f"{self.root}/images/{img_name}", img)
+        
+        self.image_ids = np.append(self.image_ids, img_id)
 
         self.head_rots = (
             np.vstack([self.head_rots, head_rot])
@@ -378,14 +395,14 @@ class NeuralNetworkModel(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
         self.head_fc = nn.Sequential(
-            nn.Linear(6, 32),
+            nn.Linear(5, 32),
             nn.GELU()
         )
 
         self.fc = nn.Sequential(
             nn.Linear(1280 + 32, 256),
             nn.GELU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.2),
             nn.Linear(256, 2)
         )
 

@@ -18,8 +18,7 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 print("\nGive file location for the data")
 dataset_type = input("Input: ")
 dataset = GazeDataset(root=f"data/{dataset_type}")
-dataset.clear()
-exit()
+
 cv2.namedWindow("Frame", cv2.WND_PROP_FULLSCREEN)
 cv2.setWindowProperty("Frame", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -33,7 +32,7 @@ TARGETS = [
 ]
 
 # Capture behavior
-capture_interval = 0.05    # seconds between frames in continuous mode
+capture_interval = 0.01    # seconds between frames in continuous mode
 target_radius = 18        # screen-drawn radius px
 font = cv2.FONT_HERSHEY_SIMPLEX
 
