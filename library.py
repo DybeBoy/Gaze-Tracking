@@ -137,10 +137,10 @@ infer_transform = transforms.Compose([
     )
 ])
 
-
+prev_head_rot = None
 def gaze_prediction(model, frame, device, face_mesh=None):
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
+    global prev_head_rot
     created_local = False
     if face_mesh is None:
         mp_face = mp.solutions.face_mesh
@@ -170,7 +170,7 @@ def gaze_prediction(model, frame, device, face_mesh=None):
 
     head_depth = get_head_depth(res, frame)
 
-    head_input = np.concatenate([head_rot, head_pos]).astype(np.float32)
+    head_input = np.concatenate([head_rot, head_pos, head_depth]).astype(np.float32)
 
     # Convert OpenCV BGR numpy array to PIL RGB image for torchvision transforms
     eye_pil = Image.fromarray(cv2.cvtColor(eye_data, cv2.COLOR_BGR2RGB))
@@ -192,8 +192,8 @@ def gaze_prediction(model, frame, device, face_mesh=None):
     }
 
 
-def clamp01(x: float) -> float:
-    return max(0.0, min(1.0, x))
+def clamp(x: float, min_val: float = 0.0, max_val: float = 1.0) -> float:
+    return max(min_val, min(max_val, x))
 
 def get_files_from_root(root):
     folders = []
@@ -269,21 +269,21 @@ class GazeDataset(Dataset):
         return len(self.image_ids)
 
     def __getitem__(self, idx):
-        img_folder_name, space, image_id = str.partition(self.image_ids[idx], "_")
+        img_folder_name, _, image_id = str.partition(self.image_ids[idx], "_")
         img_path = f"{self.root}/{img_folder_name}/images/{image_id}"
         image = Image.open(img_path).convert("RGB") 
 
         if self.transform:
             image = self.transform(image)
 
-        HEAD_SCALE = 0.5
+        HEAD_SCALE = 1
 
         head_rot = torch.tensor(self.head_rots[idx], dtype=torch.float32) * HEAD_SCALE
         head_pos = torch.tensor(self.head_pos[idx], dtype=torch.float32) * HEAD_SCALE
         head_depth = torch.tensor(self.head_depths[idx], dtype=torch.float32) * HEAD_SCALE
         label = torch.tensor(self.labels[idx], dtype=torch.float32)
 
-        return image, head_rot, head_pos, label
+        return image, head_rot, head_pos, head_depth, label
 
     def save_item(self, img, head_rot, head_pos, head_depth, label):
         new_root = str.partition(self.root, "/")[2]
@@ -385,37 +385,77 @@ class GazeDataset(Dataset):
 
         return True
     
+
 # Inputs: "eye image"(3, 96, 96), "head position, rotations and depth"(6,)
 class NeuralNetworkModel(nn.Module):
-    def __init__(self):
+    def __init__(self, freze_backbone=True):
         super().__init__()
 
         base = models.mobilenet_v2(weights="DEFAULT")
-        self.image_encoder = base.features
+        self.backbone = base.features
+
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
-        self.head_fc = nn.Sequential(
-            nn.Linear(5, 32),
-            nn.GELU()
+        self.visual_fc = nn.Sequential(
+            nn.Linear(1280, 256),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+            nn.Dropout(0.35),
+
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Dropout(0.35),
         )
 
-        self.fc = nn.Sequential(
-            nn.Linear(1280 + 32, 256),
+        self.pose_fc = nn.Sequential(
+            nn.Linear(6, 64),
+            nn.BatchNorm1d(64),
             nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(256, 2)
+
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
+            nn.Dropout(0.2),
         )
 
-    def forward(self, image, head_pos):
-        img_feat = self.image_encoder(image)
-        img_feat = self.pool(img_feat)
-        img_feat = img_feat.flatten(1)
-        
-        head_feat = self.head_fc(head_pos)
+        self.fusion = nn.Sequential(
+            nn.Linear(128 + 32, 128),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Dropout(0.4),
 
-        combined = torch.cat([img_feat, head_feat], dim=1)
-        return self.fc(combined)
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.GELU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(64, 2)
+        )
+
+        if freze_backbone:
+            self.freeze_backbone()
+
+    def forward(self, image, head):
+        x = self.backbone(image)
+        x = self.pool(x).flatten(1)
+        x = self.visual_fc(x)
+
+        h = self.pose_fc(head)
+
+        fused = torch.cat([x, h], dim=1)
+        return self.fusion(fused)
     
-    def freeze_backbone(self, freeze=True):
-        for param in self.image_encoder.parameters():
-            param.requires_grad = not freeze
+    def freeze_backbone(self):
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+    def unfreeze_backbone(self, last_n_blocks=3):
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        blocks = [m for m in self.backbone.children()]
+        for block in blocks[-last_n_blocks:]:
+            for param in block.parameters():
+                param.requires_grad = True

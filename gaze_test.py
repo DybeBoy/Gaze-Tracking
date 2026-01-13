@@ -122,7 +122,7 @@ for (nx, ny) in calib_points:
 
         images += 1
 
-        if images >= 50:
+        if images >= 25:
             is_continuous = False
             images = 0
             print("changing")
@@ -135,6 +135,15 @@ w, _, _, _ = np.linalg.lstsq(x, y, rcond=None)
 
 frame_delay = 1.0 / 10 # Target 10 FPS
 last_frame_time = time.time()
+
+previous_x, previous_y = 0.0, 0.0
+alpha = 0.35
+
+adaptive_min_alpha = 0.08
+adaptive_max_alpha = 0.55
+speed_scale = 4
+
+deadzone = 0.01
 
 try:
     while True:
@@ -153,11 +162,45 @@ try:
         if gaze_data is None:
             continue
 
-        posX, posY = np.array([gaze_data["x"], gaze_data["y"], 1.0]) @ w
-        posX, posY = int(clamp01((posX) / 2 + 0.5) * width), int(clamp01((posY) / 2 + 0.5) * height)
+        rawX, rawY = np.array([gaze_data["x"], gaze_data["y"], 1.0]) @ w
+        rawX, rawY = int(clamp((rawX) / 2 + 0.5) * width), int(clamp((rawY) / 2 + 0.5) * height)
+
+        smoothedX, smoothedY = np.array([gaze_data["x"], gaze_data["y"], 1.0]) @ w
+        smoothedX, smoothedY = clamp((smoothedX) / 2 + 0.5), clamp((smoothedY) / 2 + 0.5)
+
+        # Smooth the gaze
+        if previous_x == 0.0 and previous_y == 0.0:
+            previous_x, previous_y = smoothedX, smoothedY
+        else:
+            smoothedX = alpha * smoothedX + (1 - alpha) * previous_x
+            smoothedY = alpha * smoothedY + (1 - alpha) * previous_y
+
+        # Secondary smooth
+        speed = math.hypot(rawX - previous_x, rawY - previous_y)
+        alpha_adaptive = clamp(
+            adaptive_min_alpha + speed * speed_scale,
+            adaptive_min_alpha,
+            adaptive_max_alpha
+        )
+
+        smoothedX = alpha_adaptive * smoothedX + (1 - alpha_adaptive) * previous_x
+        smoothedY = alpha_adaptive * smoothedY + (1 - alpha_adaptive) * previous_y
+
+        if abs(smoothedX - previous_x) < deadzone:
+            smoothedX = previous_x
+        if abs(smoothedY - previous_y) < deadzone:
+            smoothedY = previous_y
+
+        previous_x, previous_y = smoothedX, smoothedY
+
+        smoothedX, smoothedY = int(smoothedX * width), int(smoothedY * height)
 
         screen[:] = (0, 0, 0)
-        cv2.circle(screen, (posX, posY), 15, (255, 0, 0), -1)
+
+        cv2.circle(screen, (rawX, rawY), 10, (155, 55, 0), -1)
+
+        cv2.circle(screen, (smoothedX, smoothedY), 15, (255, 0, 0), -1)
+
         cv2.imshow("Gaze Detection", screen)
         
         if cv2.waitKey(1) == 27:

@@ -8,19 +8,160 @@ import os
 
 # ---Setting---
 
-# Main
 BATCH_SIZE = 64
-EPOCHS = 200
-FREEZE_EPICHS = 20
-LR = 1e-3
+HEAD_ONLY_EPOCHS = 40
+PARTIAL_FREEZE_EPOCHS = 60
+FINE_TUNE_EPOCHS = 25
 
-# Scheduler
-SC_FACTOR = 0.5
-SC_PATIENCE = 8
-MIN_LR = 1e-6
+def train_model(model, train_loader, val_loader, device, epochs, stage):
 
-# Early stop
-ES_PATIENCE = 15
+    if stage == 0:
+        model.unfreeze_backbone(last_n_blocks=1)
+
+        optimizer = optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=1e-3,
+            weight_decay=1e-4
+        )
+
+    elif stage == 1:
+        model.unfreeze_backbone(last_n_blocks=3)
+
+        backbone_params = []
+        head_params = []
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "backbone" in name:
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
+
+        optimizer = optim.Adam(
+            [
+                {'params': backbone_params, 'lr': 1e-5},
+                {'params': head_params, 'lr': 5e-4}
+            ],
+            weight_decay=1e-4
+        )
+
+    else: # stage == 2
+        model.unfreeze_backbone()
+
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=5e-6,
+            weight_decay=1e-4
+        )
+
+    LOSS_WEIGHTS = torch.tensor([1.0, 1.0], device=device)
+    criterion = nn.SmoothL1Loss(beta=0.05, reduction="none")
+    
+    scaler = torch.amp.GradScaler()
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6,
+    )
+
+    best_val_loss = float("inf")
+    early_stop_counter = 0
+    early_stop_patience = 10
+
+    for epoch in range(epochs):
+
+        model.train()
+        train_loss = 0.0
+        train_loss_x = 0.0
+        train_loss_y = 0.0
+
+        for images, head_rotations, head_positions, head_depths, labels in train_loader:
+            images = images.to(device) # (batch_size, 3, 96, 96)
+            head_rotations = head_rotations.to(device) # (batch_size, 3)
+            head_positions = head_positions.to(device) #(batch_size, 2)
+            head_depths = head_depths.to(device) # (batch_size, 1)
+            head_input = torch.cat([head_rotations, head_positions, head_depths], dim=1) # (batch_size, 6)
+            labels = labels.to(device)
+
+            with torch.amp.autocast(device_type=device.type):
+                outputs = model(images, head_input)
+
+                raw_loss = criterion(outputs, labels)
+                weighted_loss = raw_loss * LOSS_WEIGHTS
+                loss = weighted_loss.mean()
+
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            train_loss += loss.item()
+            train_loss_x += raw_loss[:, 0].mean().item()
+            train_loss_y += raw_loss[:, 1].mean().item()
+
+        train_loss /= len(train_loader)
+        train_loss_x /= len(train_loader)
+        train_loss_y /= len(train_loader)
+
+        model.eval()
+        val_loss = 0.0
+        val_loss_x = 0.0
+        val_loss_y = 0.0
+
+        with torch.no_grad():
+            for images, head_rotations, head_positions, head_depths, labels in val_loader:
+                images = images.to(device)
+                head_rotations = head_rotations.to(device)
+                head_positions = head_positions.to(device) 
+                head_depths = head_depths.to(device)
+                head_input = torch.cat([head_rotations, head_positions, head_depths], dim=1) # (batch_size, 6)
+                labels = labels.to(device)
+
+                with torch.amp.autocast(device_type=device.type):
+                    outputs = model(images, head_input)
+
+                    raw_loss = criterion(outputs, labels)
+                    weighted_loss = raw_loss * LOSS_WEIGHTS
+                    loss = weighted_loss.mean()
+
+                val_loss += loss.item()
+                val_loss_x += raw_loss[:, 0].mean().item()
+                val_loss_y += raw_loss[:, 1].mean().item()
+
+        val_loss /= len(val_loader)
+        val_loss_x /= len(val_loader)
+        val_loss_y /= len(val_loader)
+
+        scheduler.step(val_loss)
+
+        print(
+            f"Epoch {epoch+1}/{epochs}: "
+            f"  Train Loss: {train_loss:.6f} "
+            f"(x: {train_loss_x:.6f}, y: {train_loss_y:.6f})  "
+            f"  Val Loss: {val_loss:.6f} "
+            f"(x: {val_loss_x:.6f}, y: {val_loss_y:.6f}) "
+            f"  LR: {optimizer.param_groups[0]['lr']:.2e} "
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            early_stop_counter = 0
+            torch.save(model.state_dict(), "best_gaze_model.pth")
+            print("Saved best model.")
+        else:
+            early_stop_counter += 1
+
+        if early_stop_counter >= early_stop_patience:
+            print("Early stopping triggered.")
+            break
+
+    for param in model.parameters():
+        param.grad = None
+
+    return best_val_loss
 
 
 def main():
@@ -63,7 +204,7 @@ def main():
             transform=transform
         )
         print("\n")
-
+        
         val_loader = DataLoader(
             val_dataset,
             batch_size=BATCH_SIZE,
@@ -74,97 +215,35 @@ def main():
             prefetch_factor=2
         )
 
-        criterion = nn.SmoothL1Loss(beta=0.05)
-        optimizer = optim.Adam(
-            model.parameters(), 
-            lr=LR,
-            weight_decay=1e-4
-        )
-        scaler = torch.amp.GradScaler()
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=SC_FACTOR,
-            patience=SC_PATIENCE,
-            min_lr=MIN_LR,
+        print("\nStarting training...\n")
+        best_val_loss = train_model(
+            model,
+            train_loader,
+            val_loader,
+            device,
+            epochs=HEAD_ONLY_EPOCHS,
+            stage=0
         )
 
-        best_val_loss = float("inf")
-        early_stop_counter = 0
-        early_stop_patience = ES_PATIENCE
+        print("\nStarting partial freeze...\n")
+        best_val_loss = train_model(
+            model,
+            train_loader,
+            val_loader,
+            device,
+            epochs=PARTIAL_FREEZE_EPOCHS,
+            stage=1
+        )
 
-        model.freeze_backbone(freeze=True)
-
-        for epoch in range(EPOCHS):
-            if epoch == FREEZE_EPICHS:
-                model.freeze_backbone(freeze=False)
-
-                print("Unfroze backbone for fine-tuning.")
-
-            model.train()
-            train_loss = 0.0
-
-            for images, head_rotations, head_positions, labels in train_loader:
-                images = images.to(device) # (batch_size, 3, 96, 96)
-                head_rotations = head_rotations.to(device) # (batch_size, 3)
-                head_positions = head_positions.to(device) #(batch_size, 2)
-                #head_depths = head_depths.to(device) # (batch_size, 1)
-                head_input = torch.cat([head_rotations, head_positions], dim=1) # (batch_size, 6)
-                labels = labels.to(device)
-
-                with torch.amp.autocast(device_type=device.type):
-                    outputs = model(images, head_input)
-                    loss = criterion(outputs, labels)
-
-                optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-
-                train_loss += loss.item()
-
-            train_loss /= len(train_loader)
-
-            model.eval()
-            val_loss = 0.0
-
-            with torch.no_grad():
-                for images, head_rotations, head_positions, labels in val_loader:
-                    images = images.to(device)
-                    head_rotations = head_rotations.to(device)
-                    head_positions = head_positions.to(device) 
-                    #head_depths = head_depths.to(device)
-                    head_input = torch.cat([head_rotations, head_positions], dim=1) # (batch_size, 6)
-                    labels = labels.to(device)
-
-                    with torch.amp.autocast(device_type=device.type):
-                        outputs = model(images, head_input)
-                        loss = criterion(outputs, labels)
-
-                    val_loss += loss.item()
-
-            val_loss /= len(val_loader)
-
-            scheduler.step(val_loss)
-
-            print(
-                f"Epoch {epoch+1}/{EPOCHS}: "
-                f"  Train Loss: {train_loss:.6f} "
-                f"  Val Loss: {val_loss:.6f} "
-                f"  LR: {optimizer.param_groups[0]['lr']:.2e} "
-            )
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                early_stop_counter = 0
-                torch.save(model.state_dict(), "best_gaze_model.pth")
-                print("Saved best model.")
-            else:
-                early_stop_counter += 1
-
-            if early_stop_counter >= early_stop_patience:
-                print("Early stopping triggered.")
-                break
+        print("\nStarting fine-tuning...\n")
+        best_val_loss = train_model(
+            model,
+            train_loader,
+            val_loader,
+            device,
+            epochs=FINE_TUNE_EPOCHS,
+            stage=2
+        )
 
     except KeyboardInterrupt:
         print("Stopping")

@@ -12,6 +12,8 @@
 data/
 data copy/
 saved models/
+unused data/
+
 
 # Ignore Python cache and virtual environments
 __pycache__/
