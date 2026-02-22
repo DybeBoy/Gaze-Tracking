@@ -16,11 +16,10 @@ def get_eye_input_data(res, frame):
     xs = [landmarks[i].x for i in eye_ids]
     ys = [landmarks[i].y for i in eye_ids]
     
-    extra = 10
-    x_min = int(min(xs) * frame.shape[1]) - 2 - extra
-    x_max = int(max(xs) * frame.shape[1]) + 2 + extra
-    y_min = int(min(ys) * frame.shape[0]) - 8 - extra
-    y_max = int(max(ys) * frame.shape[0]) + 8 + extra
+    x_min = int(min(xs) * frame.shape[1] - 12/1920*frame.shape[1])
+    x_max = int(max(xs) * frame.shape[1] + 12/1920*frame.shape[1])
+    y_min = int(min(ys) * frame.shape[0] - 18/1920*frame.shape[1])
+    y_max = int(max(ys) * frame.shape[0] + 18/1920*frame.shape[1])
 
     # Clamp coords
     x_min = max(0, x_min)
@@ -114,7 +113,7 @@ def get_head_rotations(res, frame):
     return np.array([math.degrees(yaw), math.degrees(pitch), math.degrees(roll)], dtype=np.float32) / 45.0
 
 
-def get_head_depth(res, frame):
+def get_head_depth(res, frame, base_img_width):
     landmarks = res.multi_face_landmarks[0].landmark
     eye_ids = [33, 263]
 
@@ -124,6 +123,9 @@ def get_head_depth(res, frame):
     iod_px_x = np.linalg.norm(x_positions[1] - x_positions[0])
     iod_px_y = np.linalg.norm(y_positions[1] - y_positions[0])
     iod_px = math.sqrt(iod_px_x**2 + iod_px_y**2) / frame.shape[1]
+
+    iod_px *= 10000000.0  # Scale to a more manageable range
+    iod_px /= base_img_width  # Normalize by base image width
 
     return np.array([iod_px], dtype=np.float32)
 
@@ -137,10 +139,13 @@ infer_transform = transforms.Compose([
     )
 ])
 
-prev_head_rot = None
+prev_rot = None
 def gaze_prediction(model, frame, device, face_mesh=None):
+    global prev_rot
+    head_scale = model.head_scale
+
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    global prev_head_rot
+
     created_local = False
     if face_mesh is None:
         mp_face = mp.solutions.face_mesh
@@ -160,15 +165,22 @@ def gaze_prediction(model, frame, device, face_mesh=None):
             face_mesh.close()
         return None
     
-    head_rot = get_head_rotations(res, frame)
+    head_rot = get_head_rotations(res, frame) * head_scale
     if head_rot is None:
         if created_local:
             face_mesh.close()
         return None
     
-    head_pos = get_head_position(res)
+    alpha = 0.05
+    if prev_rot is not None:
+        head_rot = alpha * head_rot + (1 - alpha) * prev_rot
+        prev_rot = head_rot
+    else:
+        prev_rot = head_rot
 
-    head_depth = get_head_depth(res, frame)
+    head_pos = get_head_position(res) * head_scale
+
+    head_depth = get_head_depth(res, frame, frame.shape[1]) * head_scale
 
     head_input = np.concatenate([head_rot, head_pos, head_depth]).astype(np.float32)
 
@@ -195,12 +207,32 @@ def gaze_prediction(model, frame, device, face_mesh=None):
 def clamp(x: float, min_val: float = 0.0, max_val: float = 1.0) -> float:
     return max(min_val, min(max_val, x))
 
+
+def randomly_increase_channels(image, channel_range=(1.0, 1.3)):
+    """
+    image: numpy array with shape (H, W, 3) or (H, W, 4)
+    channel_range: tuple of (min, max) multiplication factors
+    """
+    image = image.astype(float)  # Convert to float for processing
+    
+    # Generate random scale for each channel
+    scales = np.random.uniform(channel_range[0], channel_range[1], size=3)
+    
+    # Apply scales to each channel
+    image[:, :, :3] = image[:, :, :3] * scales
+    
+    # Clip values to valid range (e.g., 0-255)
+    image = np.clip(image, 0, 255)
+    
+    return image.astype(np.uint8)
+
+
 def get_files_from_root(root):
     folders = []
     for f in os.listdir(root):
         if f != "images" and f!= "data.npz":
             folders.append(root + "/" + f)
-    print("Folders: ", folders)
+    print("Folders: ", folders, "\n")
 
     if len(folders) == 0:
         folders.append(root)
@@ -211,14 +243,14 @@ def get_files_from_root(root):
             if os.path.isfile(os.path.join(i, f)):
                 if f[-3:] == "npz":
                     data_files.append(i + "/" + f)
-    print("Data files: ", data_files)
+    print("Data files: ", data_files, "\n")
 
     image_folders = []
     for i in folders:
         for f in os.listdir(i):
             if f == "images":
                 image_folders.append(i + "/" + f)
-    print("Image folders: ", image_folders)
+    print("Image folders: ", image_folders, "\n")
 
     if folders[0] == root:
         folders = []
@@ -227,9 +259,10 @@ def get_files_from_root(root):
 
 
 class GazeDataset(Dataset):
-    def __init__(self, root, transform=None):
+    def __init__(self, root, transform=None, head_scale=1.0):
         self.root = root
         self.transform = transform
+        self.head_scale = head_scale
         try:
             folders, data_files, image_folders = get_files_from_root(root)
 
@@ -252,7 +285,7 @@ class GazeDataset(Dataset):
             self.image_ids = data["image_ids"]
             self.head_rots = data["head_rots"]
             self.head_pos = data["head_pos"]
-            self.head_depths = data["head_depth"]
+            self.head_depths = data["head_depths"]
             self.labels = data["labels"]
             
         except FileNotFoundError:
@@ -276,11 +309,11 @@ class GazeDataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        HEAD_SCALE = 1
+        head_scale = self.head_scale
 
-        head_rot = torch.tensor(self.head_rots[idx], dtype=torch.float32) * HEAD_SCALE
-        head_pos = torch.tensor(self.head_pos[idx], dtype=torch.float32) * HEAD_SCALE
-        head_depth = torch.tensor(self.head_depths[idx], dtype=torch.float32) * HEAD_SCALE
+        head_rot = torch.tensor(self.head_rots[idx], dtype=torch.float32) * head_scale
+        head_pos = torch.tensor(self.head_pos[idx], dtype=torch.float32) * head_scale
+        head_depth = torch.tensor(self.head_depths[idx], dtype=torch.float32) * head_scale
         label = torch.tensor(self.labels[idx], dtype=torch.float32)
 
         return image, head_rot, head_pos, head_depth, label
@@ -319,7 +352,7 @@ class GazeDataset(Dataset):
             image_ids=self.image_ids,
             head_rots=self.head_rots,
             head_pos=self.head_pos,
-            head_depth=self.head_depths,
+            head_depths=self.head_depths,
             labels=self.labels
         )
 
@@ -388,53 +421,57 @@ class GazeDataset(Dataset):
 
 # Inputs: "eye image"(3, 96, 96), "head position, rotations and depth"(6,)
 class NeuralNetworkModel(nn.Module):
-    def __init__(self, freze_backbone=True):
+    def __init__(self, freeze=True, head_scale=1.0):
         super().__init__()
+
+        self.head_scale = head_scale
 
         base = models.mobilenet_v2(weights="DEFAULT")
         self.backbone = base.features
 
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
+        DROPOUT_EXTRA = 1.0
+
         self.visual_fc = nn.Sequential(
             nn.Linear(1280, 256),
             nn.BatchNorm1d(256),
             nn.GELU(),
-            nn.Dropout(0.35),
+            nn.Dropout(0.35 * DROPOUT_EXTRA),
 
             nn.Linear(256, 128),
             nn.BatchNorm1d(128),
             nn.GELU(),
-            nn.Dropout(0.35),
+            nn.Dropout(0.35 * DROPOUT_EXTRA),
         )
 
         self.pose_fc = nn.Sequential(
             nn.Linear(6, 64),
             nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.2 * DROPOUT_EXTRA),
 
             nn.Linear(64, 32),
             nn.BatchNorm1d(32),
             nn.GELU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.2 * DROPOUT_EXTRA),
         )
 
         self.fusion = nn.Sequential(
             nn.Linear(128 + 32, 128),
             nn.BatchNorm1d(128),
             nn.GELU(),
-            nn.Dropout(0.4),
+            nn.Dropout(0.4 * DROPOUT_EXTRA),
 
             nn.Linear(128, 64),
             nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.3 * DROPOUT_EXTRA),
 
             nn.Linear(64, 2)
         )
 
-        if freze_backbone:
+        if freeze:
             self.freeze_backbone()
 
     def forward(self, image, head):

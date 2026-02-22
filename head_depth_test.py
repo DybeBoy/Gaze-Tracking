@@ -20,14 +20,16 @@ while True:
     if not ret:
         continue
 
-    cv2.imshow("Head Depth Test", frame)
+    cv2.imshow("Frame", frame)
     key = cv2.waitKey(1)
     if key == 27:
         break
 
     if key == 32:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb_frame)
+        res = face_mesh.process(rgb_frame)
 
-        if results.multi_face_landmarks:
-            head_depth = get_head_depth(results, frame)
+        if res.multi_face_landmarks:
+            print(get_head_depth(res, frame))
+            eye_img = get_eye_input_data(res, frame)
+            print(get_head_depth(res, eye_img))

@@ -5,10 +5,10 @@ from torchvision import transforms
 from library import *
 import torch.optim as optim
 import os
-
+import time
 # ---Setting---
 
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 HEAD_ONLY_EPOCHS = 40
 PARTIAL_FREEZE_EPOCHS = 60
 FINE_TUNE_EPOCHS = 25
@@ -51,7 +51,7 @@ def train_model(model, train_loader, val_loader, device, epochs, stage):
 
         optimizer = optim.Adam(
             model.parameters(),
-            lr=5e-6,
+            lr=5e-5,
             weight_decay=1e-4
         )
 
@@ -171,7 +171,7 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
 
-        model = NeuralNetworkModel().to(device)
+        model = NeuralNetworkModel(head_scale=1.0).to(device)
 
         transform = transforms.Compose([
             transforms.Resize((96, 96)),
@@ -185,7 +185,8 @@ def main():
         print("\nTraining")
         train_dataset = GazeDataset(
             root="data/training", 
-            transform=transform
+            transform=transform,
+            head_scale=model.head_scale
         )
 
         train_loader = DataLoader(
@@ -201,7 +202,8 @@ def main():
         print("\nValidation")
         val_dataset = GazeDataset(
             root="data/validation",
-            transform=transform
+            transform=transform,
+            head_scale=model.head_scale
         )
         print("\n")
         
@@ -224,6 +226,7 @@ def main():
             epochs=HEAD_ONLY_EPOCHS,
             stage=0
         )
+        model.load_state_dict(torch.load("best_gaze_model.pth"))
 
         print("\nStarting partial freeze...\n")
         best_val_loss = train_model(
@@ -234,6 +237,7 @@ def main():
             epochs=PARTIAL_FREEZE_EPOCHS,
             stage=1
         )
+        model.load_state_dict(torch.load("best_gaze_model.pth"))
 
         print("\nStarting fine-tuning...\n")
         best_val_loss = train_model(
@@ -250,10 +254,14 @@ def main():
     
     finally:
         # save best model in model folder
-        os.makedirs("saved models", exist_ok=True)
-        model_idx = os.listdir("saved models")
-        torch.save(torch.load("best_gaze_model.pth"), f"saved models/gaze_model{len(model_idx)}.pth")
         print(f"{best_val_loss:.6f}")
 
+        os.makedirs("saved_models", exist_ok=True)
+        os.makedirs("saved_model_extra", exist_ok=True)
+        model_idx = os.listdir("saved_models")
+        torch.save(torch.load("best_gaze_model.pth"), f"saved_models/gaze_model{len(model_idx)}.pth")
+
+        np.save(f"saved_model_extra/head_scale{len(model_idx)}.npy", np.array([model.head_scale, best_val_loss], dtype=np.float32))
+        
 if __name__ == "__main__":
     main()

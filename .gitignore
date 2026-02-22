@@ -7,12 +7,14 @@
 *.ckpt
 *.pb
 *.pth
+*npy
 
 # Ignore folders with data
 data/
-data copy/
-saved models/
-unused data/
+data_copy/
+saved_models/
+unused_data/
+saved_model_extra/
 
 
 # Ignore Python cache and virtual environments
