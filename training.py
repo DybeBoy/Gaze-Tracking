@@ -5,10 +5,12 @@ from torchvision import transforms
 from library import *
 import torch.optim as optim
 import os
+import numpy as np
 import time
-# ---Setting---
+import shutil
 
-BATCH_SIZE = 128
+# ---Setting---
+BATCH_SIZE = 64
 HEAD_ONLY_EPOCHS = 40
 PARTIAL_FREEZE_EPOCHS = 60
 FINE_TUNE_EPOCHS = 25
@@ -78,14 +80,16 @@ def train_model(model, train_loader, val_loader, device, epochs, stage):
         train_loss_x = 0.0
         train_loss_y = 0.0
 
-        for images, head_rotations, head_positions, head_depths, labels in train_loader:
-            images = images.to(device) # (batch_size, 3, 96, 96)
-            head_rotations = head_rotations.to(device) # (batch_size, 3)
-            head_positions = head_positions.to(device) #(batch_size, 2)
+        for images, head_rotations, head_positions, head_depths, iris, labels in train_loader:
+            images = images.to(device) # (batch_size, 3, 224, 224)
+            head_rotations = head_rotations.to(device) # (batch_size, 6)
+            head_positions = head_positions.to(device) # (batch_size, 2)
             head_depths = head_depths.to(device) # (batch_size, 1)
-            head_input = torch.cat([head_rotations, head_positions, head_depths], dim=1) # (batch_size, 6)
+            iris = iris.to(device) # (batch_size, 4)
+            head_input = torch.cat([head_rotations, head_positions, head_depths, iris], dim=1) # (batch_size, 13)
             labels = labels.to(device)
 
+            optimizer.zero_grad()
             with torch.amp.autocast(device_type=device.type):
                 outputs = model(images, head_input)
 
@@ -93,7 +97,6 @@ def train_model(model, train_loader, val_loader, device, epochs, stage):
                 weighted_loss = raw_loss * LOSS_WEIGHTS
                 loss = weighted_loss.mean()
 
-            optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -112,12 +115,13 @@ def train_model(model, train_loader, val_loader, device, epochs, stage):
         val_loss_y = 0.0
 
         with torch.no_grad():
-            for images, head_rotations, head_positions, head_depths, labels in val_loader:
+            for images, head_rotations, head_positions, head_depths, iris, labels in val_loader:
                 images = images.to(device)
                 head_rotations = head_rotations.to(device)
                 head_positions = head_positions.to(device) 
                 head_depths = head_depths.to(device)
-                head_input = torch.cat([head_rotations, head_positions, head_depths], dim=1) # (batch_size, 6)
+                iris = iris.to(device)
+                head_input = torch.cat([head_rotations, head_positions, head_depths, iris], dim=1) # (batch_size, 13)
                 labels = labels.to(device)
 
                 with torch.amp.autocast(device_type=device.type):
@@ -165,6 +169,9 @@ def train_model(model, train_loader, val_loader, device, epochs, stage):
 
 
 def main():
+    start_time = time.time()
+
+    best_val_loss = float("inf")
     try:
         torch.backends.cudnn.benchmark = True
 
@@ -174,7 +181,7 @@ def main():
         model = NeuralNetworkModel(head_scale=1.0).to(device)
 
         transform = transforms.Compose([
-            transforms.Resize((96, 96)),
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
@@ -251,17 +258,29 @@ def main():
 
     except KeyboardInterrupt:
         print("Stopping")
+        stopped_early = True
     
     finally:
-        # save best model in model folder
-        print(f"{best_val_loss:.6f}")
+        if 'stopped_early' in locals() and stopped_early:
+            save_choice = input("Training stopped early. Do you want to save the current model? (y/n): ")
+            if save_choice.lower() == 'n':
+                print("Model not saved.")
+                return
 
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print(f"Total execution time: {elapsed_time / 60:.2f} minutes")
+
+        # save best model in model folder
         os.makedirs("saved_models", exist_ok=True)
         os.makedirs("saved_model_extra", exist_ok=True)
         model_idx = os.listdir("saved_models")
-        torch.save(torch.load("best_gaze_model.pth"), f"saved_models/gaze_model{len(model_idx)}.pth")
+        
+        shutil.copyfile("best_gaze_model.pth", f"saved_models/gaze_model{len(model_idx)}.pth")
 
         np.save(f"saved_model_extra/head_scale{len(model_idx)}.npy", np.array([model.head_scale, best_val_loss], dtype=np.float32))
+
+        print(f"Model saved with best validation loss: {best_val_loss:.6f}")
         
 if __name__ == "__main__":
     main()

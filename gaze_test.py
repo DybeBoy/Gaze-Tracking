@@ -2,10 +2,10 @@ import time
 import torch
 import cv2
 import numpy as np
-import pyautogui
 import mediapipe as mp
 from library import *
 import os
+import math
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -50,14 +50,6 @@ model = NeuralNetworkModel(head_scale=head_scale).to(device)
 model.load_state_dict(torch.load(f"saved_models/gaze_model{model_num}.pth", map_location=device))
 model.eval()
 
-# Screen size
-width, height = pyautogui.size()
-screen = np.zeros((height, width, 3), dtype=np.uint8)
-
-# Setup Mediapipe
-mp_face = mp.solutions.face_mesh
-face_mesh = mp_face.FaceMesh(refine_landmarks=True)
-
 # Webcam
 supported = []
 fps = []
@@ -73,26 +65,24 @@ fps = np.load("webcam_fps.npy")
 
 mp_face = mp.solutions.face_mesh
 face_mesh = mp_face.FaceMesh(refine_landmarks=True)
-cap = cv2.VideoCapture(1)
+cap = cv2.VideoCapture(0)
 
 print("\nSupported resolutions:")
 for i, (w, h) in enumerate(supported):
     print(f" {i}: {w}x{h}, {fps[i]:.3f} FPS")
 answer = int(input("Select resolution index: "))
 
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, supported[answer][0])
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, supported[answer][1])
 cap.set(cv2.CAP_PROP_FPS, fps[answer])
 
 cv2.namedWindow("Gaze Detection", cv2.WND_PROP_FULLSCREEN)
 cv2.setWindowProperty("Gaze Detection", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-"""
-calib_points = [
-    (-0.8, -0.8),   (0, -0.8),   (0.8, -0.8),
-    (-0.8,  0  ),   (0,  0  ),   (0.8,  0  ),
-    (-0.8,  0.8),   (0,  0.8),   (0.8,  0.8),
-]
-"""
+
+width, height = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+width, height = int(width), int(height)
+
 calib_points = [
     # Center
     (0.5, 0.5),
@@ -125,11 +115,13 @@ targets = []
 is_continuous = False
 last_capture_time = 0.0
 capture_interval = 0.12
+CALIB_SAMPLES_PER_POINT = 5
 
 for (nx, ny) in calib_points:
     px, py = int((nx / 2 + 0.5) * width), int((ny / 2 + 0.5) * height)
 
     images = 0
+    point_preds = []
 
     while True:
         now = time.time()
@@ -142,7 +134,6 @@ for (nx, ny) in calib_points:
         res = face_mesh.process(rgb)
 
         screen = frame.copy()
-        screen = cv2.resize(screen, (width, height))
         cv2.circle(screen, (px, py), 15, (0, 255, 0), -1)
         cv2.imshow("Gaze Detection", screen)
 
@@ -175,16 +166,16 @@ for (nx, ny) in calib_points:
         landmarks = res.multi_face_landmarks[0].landmark
         pred = gaze_prediction(model, frame, device, face_mesh)
 
-        preds.append([pred["x"], pred["y"]])
-        targets.append([nx, ny])
-
+        point_preds.append([pred["x"], pred["y"]])
         images += 1
 
-        if images >= 1:
+        if images >= CALIB_SAMPLES_PER_POINT:
             is_continuous = False
             images = 0
-            #print("changing")
             break
+
+    preds.append(np.mean(point_preds, axis=0).tolist())
+    targets.append([nx, ny])
 
 x = np.hstack([preds, np.ones((len(preds), 1))])
 y = np.array(targets)
@@ -221,20 +212,22 @@ try:
             continue
 
         rawX, rawY = np.array([gaze_data["x"], gaze_data["y"], 1.0]) @ w
-        rawX, rawY = int(clamp((rawX) / 2 + 0.5) * width), int(clamp((rawY) / 2 + 0.5) * height)
+        raw_norm_x = clamp((rawX) / 2 + 0.5)
+        raw_norm_y = clamp((rawY) / 2 + 0.5)
+        rawX, rawY = int(raw_norm_x * width), int(raw_norm_y * height)
 
-        smoothedX, smoothedY = np.array([gaze_data["x"], gaze_data["y"], 1.0]) @ w
-        smoothedX, smoothedY = clamp((smoothedX) / 2 + 0.5), clamp((smoothedY) / 2 + 0.5)
+        smoothedX, smoothedY = raw_norm_x, raw_norm_y
 
         # Smooth the gaze
         if previous_x == 0.0 and previous_y == 0.0:
             previous_x, previous_y = smoothedX, smoothedY
         else:
+            # Stage 1: fixed gentle EMA
             smoothedX = alpha * smoothedX + (1 - alpha) * previous_x
             smoothedY = alpha * smoothedY + (1 - alpha) * previous_y
 
-        # Secondary smooth
-        speed = math.hypot(rawX - previous_x, rawY - previous_y)
+        # Stage 2: adaptive EMA — speed from normalized coords
+        speed = math.hypot(raw_norm_x - previous_x, raw_norm_y - previous_y)
         alpha_adaptive = clamp(
             adaptive_min_alpha + speed * speed_scale,
             adaptive_min_alpha,
@@ -254,7 +247,6 @@ try:
         smoothedX, smoothedY = int(smoothedX * width), int(smoothedY * height)
 
         screen = frame.copy()
-        screen = cv2.resize(screen, (width, height))
         cv2.circle(screen, (rawX, rawY), 10, (155, 55, 0), -1)
         cv2.circle(screen, (smoothedX, smoothedY), 15, (255, 0, 0), -1)
         cv2.imshow("Gaze Detection", screen)

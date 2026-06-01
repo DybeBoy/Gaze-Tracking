@@ -1,0 +1,13 @@
+# PyTorch with CUDA 13.0 support (RTX 5070 / Blackwell)
+# Install with: pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu130
+torch==2.11.0
+torchvision==0.26.0
+
+# Computer vision & face tracking
+mediapipe==0.10.33
+opencv-python==4.13.0.92
+
+# Data & utilities
+numpy==2.2.6
+Pillow==12.1.1
+pyautogui==0.9.54

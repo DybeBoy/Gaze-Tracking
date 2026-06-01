@@ -2,6 +2,7 @@ import mediapipe as mp
 import cv2
 from library import *
 import time
+import numpy as np
 
 supported = []
 fps = []
@@ -24,6 +25,7 @@ for i, (width, height) in enumerate(supported):
     print(f" {i}: {width}x{height}, {fps[i]:.3f} FPS")
 answer = int(input("Select resolution index: "))
 
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, supported[answer][0])
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, supported[answer][1])
 cap.set(cv2.CAP_PROP_FPS, fps[answer])
@@ -69,6 +71,7 @@ font = cv2.FONT_HERSHEY_SIMPLEX
 
 # --- State ---
 w, h = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+w, h = int(w), int(h)
 
 point_idx = 0
 is_continuous = False
@@ -196,9 +199,16 @@ while True:
         print("No face detected. Skipping frame.")
         continue
 
-    eye_img = get_eye_input_data(res, frame)
-    if eye_img is None:
-        print("Could not extract eye region. Skipping frame.")
+    # Reject detections where key landmarks are outside the frame (partially cropped face)
+    landmarks = res.multi_face_landmarks[0].landmark
+    key_ids = [33, 133, 362, 263, 1, 61, 291, 199]
+    if any(not (0.0 <= landmarks[i].x <= 1.0 and 0.0 <= landmarks[i].y <= 1.0) for i in key_ids):
+        print("Key landmarks outside frame bounds. Skipping frame.")
+        continue
+
+    face_img = get_face_crop(res, frame)
+    if face_img is None:
+        print("Could not extract face region. Skipping frame.")
         continue
 
     head_rot = get_head_rotations(res, frame)
@@ -210,27 +220,40 @@ while True:
 
     head_pos = get_head_position(res)
 
+    iris = get_iris_landmarks(res)
+
     label = np.array([(nx-0.5)*2, (ny-0.5)*2], dtype=np.float32)
 
     # Mirror data to get more image per image
-    m_eye_img = cv2.flip(eye_img, 1)
+    m_face_img = cv2.flip(face_img, 1)
+
+    # Apply independent random channel/brightness augmentation to each copy
+    face_img = randomly_increase_channels(face_img)
+    m_face_img = randomly_increase_channels(m_face_img)
 
     m_head_rot = head_rot.copy()
-    m_head_rot[0] = -m_head_rot[0]  # invert yaw
-    m_head_rot[2] = -m_head_rot[2]  # invert roll
+    # 6D rotation (rmat[:, :2].flatten() = [r00,r10,r20, r01,r11,r21])
+    # Horizontal flip negates the x-row: indices 0, 2, 3, 5
+    m_head_rot[0] = -m_head_rot[0]
+    m_head_rot[2] = -m_head_rot[2]
+    m_head_rot[3] = -m_head_rot[3]
+    m_head_rot[5] = -m_head_rot[5]
 
     m_head_pos = head_pos.copy()
     m_head_pos[0] = -m_head_pos[0]  # invert x position
 
     m_head_depth = head_depth.copy()
 
+    # Mirror iris: swap left/right eye and invert x ratios
+    m_iris = np.array([-iris[2], -iris[3], -iris[0], -iris[1]], dtype=np.float32)
+
     m_label = label.copy()
     if m_label[0] != 0: 
         m_label[0] = -m_label[0]  # invert x label
 
     # Save data
-    dataset.save_item(eye_img, head_rot, head_pos, head_depth, label)
-    dataset.save_item(m_eye_img, m_head_rot, m_head_pos, m_head_depth, m_label)
+    dataset.save_item(face_img, head_rot, head_pos, head_depth, iris, label)
+    dataset.save_item(m_face_img, m_head_rot, m_head_pos, m_head_depth, m_iris, m_label)
 
     counts[point_idx] += 2
     total_saved += 2
@@ -254,3 +277,4 @@ while True:
 """
 cap.release()
 cv2.destroyAllWindows()
+dataset.flush()

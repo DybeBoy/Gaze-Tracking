@@ -10,35 +10,35 @@ import torch
 import os
 import math
 
-def get_eye_input_data(res, frame):
+def get_face_crop(res, frame):
     landmarks = res.multi_face_landmarks[0].landmark
-    eye_ids = [33, 133, 362, 263]
-    xs = [landmarks[i].x for i in eye_ids]
-    ys = [landmarks[i].y for i in eye_ids]
-    
-    x_min = int(min(xs) * frame.shape[1] - 12/1920*frame.shape[1])
-    x_max = int(max(xs) * frame.shape[1] + 12/1920*frame.shape[1])
-    y_min = int(min(ys) * frame.shape[0] - 18/1920*frame.shape[1])
-    y_max = int(max(ys) * frame.shape[0] + 18/1920*frame.shape[1])
+    xs = [lm.x for lm in landmarks]
+    ys = [lm.y for lm in landmarks]
 
-    # Clamp coords
+    h, w = frame.shape[:2]
+    # Add 15% margin around the face bounding box
+    margin_x = (max(xs) - min(xs)) * 0.15
+    margin_y = (max(ys) - min(ys)) * 0.15
+
+    x_min = int((min(xs) - margin_x) * w)
+    x_max = int((max(xs) + margin_x) * w)
+    y_min = int((min(ys) - margin_y) * h)
+    y_max = int((max(ys) + margin_y) * h)
+
     x_min = max(0, x_min)
     y_min = max(0, y_min)
-    x_max = min(frame.shape[1], x_max)
-    y_max = min(frame.shape[0], y_max)
+    x_max = min(w, x_max)
+    y_max = min(h, y_max)
 
-    # Validate coords
     if x_min >= x_max or y_min >= y_max:
         return None
 
-    eye_img = frame[y_min:y_max, x_min:x_max]
-    if eye_img.size == 0:
+    face_img = frame[y_min:y_max, x_min:x_max]
+    if face_img.size == 0:
         return None
-    
-    eye_img = cv2.resize(eye_img, (96, 96))
-    #eye_img = cv2.cvtColor(eye_img, cv2.COLOR_BGR2RGB)
 
-    return eye_img
+    face_img = cv2.resize(face_img, (224, 224))
+    return face_img
 
 
 def get_head_position(res):
@@ -51,6 +51,40 @@ def get_head_position(res):
                 ((y_positions[0] + y_positions[1]) / 2 - 0.5) * 2]
 
     return np.array(head_pos, dtype=np.float32)
+
+def get_iris_landmarks(res):
+    landmarks = res.multi_face_landmarks[0].landmark
+
+    # Left eye: outer corner 33, inner corner 133, iris center 468
+    # Right eye: inner corner 362, outer corner 263, iris center 473
+    l_outer_x = landmarks[33].x
+    l_outer_y = landmarks[33].y
+    l_inner_x = landmarks[133].x
+    l_inner_y = landmarks[133].y
+    l_iris_x  = landmarks[468].x
+    l_iris_y  = landmarks[468].y
+
+    r_inner_x = landmarks[362].x
+    r_inner_y = landmarks[362].y
+    r_outer_x = landmarks[263].x
+    r_outer_y = landmarks[263].y
+    r_iris_x  = landmarks[473].x
+    r_iris_y  = landmarks[473].y
+
+    def ratio(iris, a, b):
+        span = b - a
+        if abs(span) < 1e-6:
+            return 0.5
+        return (iris - a) / span
+
+    # Horizontal and vertical iris ratio within each eye, both in [0, 1]
+    l_x = ratio(l_iris_x, l_outer_x, l_inner_x)
+    l_y = ratio(l_iris_y, l_outer_y, l_inner_y)
+    r_x = ratio(r_iris_x, r_inner_x, r_outer_x)
+    r_y = ratio(r_iris_y, r_inner_y, r_outer_y)
+
+    # Shift to [-1, 1] so the center of the eye is 0
+    return np.array([l_x * 2 - 1, l_y * 2 - 1, r_x * 2 - 1, r_y * 2 - 1], dtype=np.float32)
 
 def get_head_rotations(res, frame):
     landmarks = res.multi_face_landmarks[0].landmark
@@ -97,20 +131,10 @@ def get_head_rotations(res, frame):
         return None
 
     rmat, _ = cv2.Rodrigues(rotation_vector)
-    sy = math.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2)
-    singular = sy < 1e-6
 
-    if not singular:
-        pitch = math.atan2(rmat[2, 1], rmat[2, 2])
-        yaw = math.atan2(-rmat[2, 0], sy)
-        roll = math.atan2(rmat[1, 0], rmat[0, 0])
-    else:
-        pitch = math.atan2(-rmat[1, 2], rmat[1, 1])
-        yaw = math.atan2(-rmat[2, 0], sy)
-        roll = 0.0
-
-    # Return normalized angles as float32. Scaling by 45 keeps values in a reasonable [-1,1] range for training.
-    return np.array([math.degrees(yaw), math.degrees(pitch), math.degrees(roll)], dtype=np.float32) / 45.0
+    # 6D rotation representation (Zhou et al. 2019): first two columns of the
+    # rotation matrix, flattened. Continuous everywhere, no gimbal lock.
+    return rmat[:, :2].flatten().astype(np.float32)
 
 
 def get_head_depth(res, frame, base_img_width):
@@ -122,16 +146,19 @@ def get_head_depth(res, frame, base_img_width):
 
     iod_px_x = np.linalg.norm(x_positions[1] - x_positions[0])
     iod_px_y = np.linalg.norm(y_positions[1] - y_positions[0])
-    iod_px = math.sqrt(iod_px_x**2 + iod_px_y**2) / frame.shape[1]
+    # IOD as a fraction of frame width (landmarks are already normalized to [0,1])
+    iod_normalized = math.sqrt(iod_px_x**2 + iod_px_y**2)
 
-    iod_px *= 10000000.0  # Scale to a more manageable range
-    iod_px /= base_img_width  # Normalize by base image width
+    # Scale to a NN-friendly range. Dividing by base_img_width makes values
+    # consistent across resolutions (iod_normalized grows with resolution, so
+    # this keeps the output stable when switching cameras/resolutions).
+    depth_proxy = iod_normalized * 10000000.0 / base_img_width
 
-    return np.array([iod_px], dtype=np.float32)
+    return np.array([depth_proxy], dtype=np.float32)
 
 # Reusable inference transform to avoid recreating it every frame
 infer_transform = transforms.Compose([
-    transforms.Resize((96, 96)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
@@ -159,17 +186,18 @@ def gaze_prediction(model, frame, device, face_mesh=None):
             face_mesh.close()
         return None
 
-    eye_data = get_eye_input_data(res, frame)
-    if eye_data is None:
+    face_data = get_face_crop(res, frame)
+    if face_data is None:
         if created_local:
             face_mesh.close()
         return None
     
-    head_rot = get_head_rotations(res, frame) * head_scale
+    head_rot = get_head_rotations(res, frame)
     if head_rot is None:
         if created_local:
             face_mesh.close()
         return None
+    head_rot = head_rot * head_scale
     
     alpha = 0.05
     if prev_rot is not None:
@@ -182,16 +210,18 @@ def gaze_prediction(model, frame, device, face_mesh=None):
 
     head_depth = get_head_depth(res, frame, frame.shape[1]) * head_scale
 
-    head_input = np.concatenate([head_rot, head_pos, head_depth]).astype(np.float32)
+    iris = get_iris_landmarks(res)
+
+    head_input = np.concatenate([head_rot, head_pos, head_depth, iris]).astype(np.float32)
 
     # Convert OpenCV BGR numpy array to PIL RGB image for torchvision transforms
-    eye_pil = Image.fromarray(cv2.cvtColor(eye_data, cv2.COLOR_BGR2RGB))
-    eye_tensor = infer_transform(eye_pil).unsqueeze(0).to(device)
+    face_pil = Image.fromarray(cv2.cvtColor(face_data, cv2.COLOR_BGR2RGB))
+    face_tensor = infer_transform(face_pil).unsqueeze(0).to(device)
     
     head_input_tensor = torch.tensor(head_input).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        prediction = model(eye_tensor, head_input_tensor)
+        prediction = model(face_tensor, head_input_tensor)
 
     gaze = prediction.cpu().numpy()
 
@@ -263,6 +293,7 @@ class GazeDataset(Dataset):
         self.root = root
         self.transform = transform
         self.head_scale = head_scale
+        self._dirty = 0
         try:
             folders, data_files, image_folders = get_files_from_root(root)
 
@@ -286,6 +317,7 @@ class GazeDataset(Dataset):
             self.head_rots = data["head_rots"]
             self.head_pos = data["head_pos"]
             self.head_depths = data["head_depths"]
+            self.iris = data["iris"]
             self.labels = data["labels"]
             
         except FileNotFoundError:
@@ -293,6 +325,7 @@ class GazeDataset(Dataset):
             self.head_rots = np.array([])
             self.head_pos = np.array([])
             self.head_depths = np.array([])
+            self.iris = np.array([])
             self.labels = np.array([])
 
             os.makedirs(f"{self.root}/images", exist_ok=True)
@@ -314,11 +347,12 @@ class GazeDataset(Dataset):
         head_rot = torch.tensor(self.head_rots[idx], dtype=torch.float32) * head_scale
         head_pos = torch.tensor(self.head_pos[idx], dtype=torch.float32) * head_scale
         head_depth = torch.tensor(self.head_depths[idx], dtype=torch.float32) * head_scale
+        iris = torch.tensor(self.iris[idx], dtype=torch.float32)
         label = torch.tensor(self.labels[idx], dtype=torch.float32)
 
-        return image, head_rot, head_pos, head_depth, label
+        return image, head_rot, head_pos, head_depth, iris, label
 
-    def save_item(self, img, head_rot, head_pos, head_depth, label):
+    def save_item(self, img, head_rot, head_pos, head_depth, iris, label, flush_every=20):
         new_root = str.partition(self.root, "/")[2]
         last_root_folder = str.partition(new_root, "/")[2]
         img_name = f"{len(self.image_ids):07d}.png"
@@ -342,19 +376,31 @@ class GazeDataset(Dataset):
             if self.head_depths.size else np.array([head_depth])
         )
 
+        self.iris = (
+            np.vstack([self.iris, iris])
+            if self.iris.size else np.array([iris])
+        )
+
         self.labels = (
             np.vstack([self.labels, label])
             if self.labels.size else np.array([label])
         )
 
+        self._dirty += 1
+        if self._dirty >= flush_every:
+            self.flush()
+
+    def flush(self):
         np.savez(
             f"{self.root}/data.npz",
             image_ids=self.image_ids,
             head_rots=self.head_rots,
             head_pos=self.head_pos,
             head_depths=self.head_depths,
+            iris=self.iris,
             labels=self.labels
         )
+        self._dirty = 0
 
     def clear(self):
         # Get user confirmation
@@ -369,6 +415,7 @@ class GazeDataset(Dataset):
         self.head_rots = np.array([])
         self.head_pos = np.array([])
         self.head_depths = np.array([])
+        self.iris = np.array([])
         self.labels = np.array([])
 
         folders, data_files, image_folders = get_files_from_root(self.root)
@@ -404,6 +451,7 @@ class GazeDataset(Dataset):
         self.head_rots = np.delete(self.head_rots, idx, axis=0)
         self.head_pos = np.delete(self.head_pos, idx, axis=0)
         self.head_depths = np.delete(self.head_depths, idx, axis=0)
+        self.iris = np.delete(self.iris, idx, axis=0)
         self.labels = np.delete(self.labels, idx, axis=0)
 
         # Save updated data
@@ -412,14 +460,15 @@ class GazeDataset(Dataset):
             image_ids=self.image_ids,
             head_rots=self.head_rots,
             head_pos=self.head_pos,
-            head_depth=self.head_depths,
+            head_depths=self.head_depths,
+            iris=self.iris,
             labels=self.labels
         )
 
         return True
     
 
-# Inputs: "eye image"(3, 96, 96), "head position, rotations and depth"(6,)
+# Inputs: "eye image"(3, 224, 224), "head features"(13,): 6D rotation(6) + head pos(2) + depth(1) + iris(4)
 class NeuralNetworkModel(nn.Module):
     def __init__(self, freeze=True, head_scale=1.0):
         super().__init__()
@@ -431,42 +480,40 @@ class NeuralNetworkModel(nn.Module):
 
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
-        DROPOUT_EXTRA = 1.0
-
         self.visual_fc = nn.Sequential(
             nn.Linear(1280, 256),
             nn.BatchNorm1d(256),
             nn.GELU(),
-            nn.Dropout(0.35 * DROPOUT_EXTRA),
+            nn.Dropout(0.35),
 
             nn.Linear(256, 128),
             nn.BatchNorm1d(128),
             nn.GELU(),
-            nn.Dropout(0.35 * DROPOUT_EXTRA),
+            nn.Dropout(0.35),
         )
 
         self.pose_fc = nn.Sequential(
-            nn.Linear(6, 64),
+            nn.Linear(13, 64),
             nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.Dropout(0.2 * DROPOUT_EXTRA),
+            nn.Dropout(0.2),
 
             nn.Linear(64, 32),
             nn.BatchNorm1d(32),
             nn.GELU(),
-            nn.Dropout(0.2 * DROPOUT_EXTRA),
+            nn.Dropout(0.2),
         )
 
         self.fusion = nn.Sequential(
             nn.Linear(128 + 32, 128),
             nn.BatchNorm1d(128),
             nn.GELU(),
-            nn.Dropout(0.4 * DROPOUT_EXTRA),
+            nn.Dropout(0.4),
 
             nn.Linear(128, 64),
             nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.Dropout(0.3 * DROPOUT_EXTRA),
+            nn.Dropout(0.3),
 
             nn.Linear(64, 2)
         )
