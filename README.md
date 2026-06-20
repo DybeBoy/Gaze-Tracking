@@ -8,14 +8,14 @@ Captures webcam frames, extracts facial landmarks and head pose information, and
 
 ## What it uses
 
-- **PyTorch** — small neural network with a MobileNetV2 visual backbone fused with a head-pose pathway; outputs screen gaze coordinates
-- **MediaPipe** — face mesh detection (468 landmarks) used to extract head rotation, position, depth, and iris positions
-- **OpenCV** — webcam capture, frame processing, and visualization
-- **NumPy** — data storage and numerical operations
+- **PyTorch**: small neural network with a MobileNetV2 visual backbone fused with a head-pose pathway; outputs screen gaze coordinates
+- **MediaPipe**: face mesh detection (468 landmarks) used to extract head rotation, position, depth, and iris positions
+- **OpenCV**: webcam capture, frame processing, and visualization
+- **NumPy**: data storage and numerical operations
 
 ## Neural network
 
-This is a small neural network project. The model has two input pathways — one for the cropped face image (MobileNetV2 backbone) and one for 13-dimensional head pose features — which are fused and passed through a small fully connected head to produce (x, y) gaze coordinates. Training uses progressive fine-tuning across three stages.
+This is a small neural network project. The model has two input pathways, one for the cropped face image (MobileNetV2 backbone) and one for 13-dimensional head pose features, which are fused and passed through a small fully connected head to produce (x, y) gaze coordinates. Training uses progressive fine-tuning across three stages.
 
 ## Scripts
 
