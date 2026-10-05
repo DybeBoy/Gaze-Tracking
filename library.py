@@ -1,6 +1,27 @@
 import mediapipe as mp
 import cv2
 import numpy as np
+import time
+
+BaseOptions = mp.tasks.BaseOptions
+FaceLandmarker = mp.tasks.vision.FaceLandmarker
+FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+FACE_LANDMARKER_MODEL_PATH = "face_landmarker.task"
+_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+)
+
+def _ensure_model():
+    import os, urllib.request
+    if not os.path.exists(FACE_LANDMARKER_MODEL_PATH):
+        print(f"Downloading face landmarker model to {FACE_LANDMARKER_MODEL_PATH}...")
+        urllib.request.urlretrieve(_MODEL_URL, FACE_LANDMARKER_MODEL_PATH)
+        print("Download complete.")
+
+_ensure_model()
 from torch.utils.data import Dataset
 from torchvision import transforms
 import torch.nn as nn
@@ -8,10 +29,11 @@ import torchvision.models as models
 from PIL import Image
 import torch
 import os
+import io
 import math
 
 def get_face_crop(res, frame):
-    landmarks = res.multi_face_landmarks[0].landmark
+    landmarks = res.face_landmarks[0]
     xs = [lm.x for lm in landmarks]
     ys = [lm.y for lm in landmarks]
 
@@ -42,7 +64,7 @@ def get_face_crop(res, frame):
 
 
 def get_head_position(res):
-    landmarks = res.multi_face_landmarks[0].landmark
+    landmarks = res.face_landmarks[0]
     eye_ids = [33, 263]
 
     x_positions = [landmarks[i].x for i in eye_ids]
@@ -53,7 +75,7 @@ def get_head_position(res):
     return np.array(head_pos, dtype=np.float32)
 
 def get_iris_landmarks(res):
-    landmarks = res.multi_face_landmarks[0].landmark
+    landmarks = res.face_landmarks[0]
 
     # Left eye: outer corner 33, inner corner 133, iris center 468
     # Right eye: inner corner 362, outer corner 263, iris center 473
@@ -87,7 +109,7 @@ def get_iris_landmarks(res):
     return np.array([l_x * 2 - 1, l_y * 2 - 1, r_x * 2 - 1, r_y * 2 - 1], dtype=np.float32)
 
 def get_head_rotations(res, frame):
-    landmarks = res.multi_face_landmarks[0].landmark
+    landmarks = res.face_landmarks[0]
 
     FACE_IDS = {
         "nose_tip": 1,
@@ -138,7 +160,7 @@ def get_head_rotations(res, frame):
 
 
 def get_head_depth(res, frame, base_img_width):
-    landmarks = res.multi_face_landmarks[0].landmark
+    landmarks = res.face_landmarks[0]
     eye_ids = [33, 263]
 
     x_positions = [landmarks[i].x for i in eye_ids]
@@ -167,35 +189,43 @@ infer_transform = transforms.Compose([
 ])
 
 prev_rot = None
-def gaze_prediction(model, frame, device, face_mesh=None):
+def gaze_prediction(model, frame, device, face_landmarker=None):
     global prev_rot
     head_scale = model.head_scale
 
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
     created_local = False
-    if face_mesh is None:
-        mp_face = mp.solutions.face_mesh
-        face_mesh = mp_face.FaceMesh(refine_landmarks=True)
+    if face_landmarker is None:
+        options = FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=FACE_LANDMARKER_MODEL_PATH),
+            running_mode=VisionRunningMode.IMAGE,
+            num_faces=1
+        )
+        face_landmarker = FaceLandmarker.create_from_options(options)
         created_local = True
 
-    res = face_mesh.process(rgb_frame)
+    if created_local:
+        res = face_landmarker.detect(mp_image)
+    else:
+        res = face_landmarker.detect_for_video(mp_image, int(time.time() * 1000))
 
-    if not res.multi_face_landmarks:
+    if not res.face_landmarks:
         if created_local:
-            face_mesh.close()
+            face_landmarker.close()
         return None
 
     face_data = get_face_crop(res, frame)
     if face_data is None:
         if created_local:
-            face_mesh.close()
+            face_landmarker.close()
         return None
     
     head_rot = get_head_rotations(res, frame)
     if head_rot is None:
         if created_local:
-            face_mesh.close()
+            face_landmarker.close()
         return None
     head_rot = head_rot * head_scale
     
@@ -226,7 +256,7 @@ def gaze_prediction(model, frame, device, face_mesh=None):
     gaze = prediction.cpu().numpy()
 
     if created_local:
-        face_mesh.close()
+        face_landmarker.close()
 
     return {
         "x": gaze[0][0],
@@ -335,9 +365,22 @@ class GazeDataset(Dataset):
         return len(self.image_ids)
 
     def __getitem__(self, idx):
-        img_folder_name, _, image_id = str.partition(self.image_ids[idx], "_")
-        img_path = f"{self.root}/{img_folder_name}/images/{image_id}"
-        image = Image.open(img_path).convert("RGB") 
+        for _ in range(10):
+            img_folder_name, _, image_id = str.partition(self.image_ids[idx], "_")
+            img_path = f"{self.root}/{img_folder_name}/images/{image_id}"
+            try:
+                # Read fully into memory before passing to PIL so that corrupt
+                # filesystem blocks raise a catchable OSError instead of
+                # sending SIGBUS (which kills the worker process outright).
+                with open(img_path, "rb") as f:
+                    img_bytes = f.read()
+                image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                break
+            except OSError:
+                print(f"Warning: skipping corrupted image {img_path}")
+                idx = np.random.randint(len(self.image_ids))
+        else:
+            raise RuntimeError(f"Failed to load a valid image after 10 attempts in {self.root}")
 
         if self.transform:
             image = self.transform(image)
@@ -475,25 +518,27 @@ class NeuralNetworkModel(nn.Module):
 
         self.head_scale = head_scale
 
-        base = models.mobilenet_v2(weights="DEFAULT")
+        base = models.mobilenet_v3_large(weights="DEFAULT")
         self.backbone = base.features
 
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
+        # MobileNetV3-Large features output 960 channels
         self.visual_fc = nn.Sequential(
-            nn.Linear(1280, 256),
-            nn.BatchNorm1d(256),
+            nn.Linear(960, 512),
+            nn.BatchNorm1d(512),
             nn.GELU(),
             nn.Dropout(0.35),
 
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
             nn.GELU(),
             nn.Dropout(0.35),
         )
 
+        # Head pose branch: 6D rotation + 2D position + 1D depth = 9 dims
         self.pose_fc = nn.Sequential(
-            nn.Linear(13, 64),
+            nn.Linear(9, 64),
             nn.BatchNorm1d(64),
             nn.GELU(),
             nn.Dropout(0.2),
@@ -504,8 +549,21 @@ class NeuralNetworkModel(nn.Module):
             nn.Dropout(0.2),
         )
 
+        # Iris branch: 4 dims — kept separate as the direct gaze signal
+        self.iris_fc = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
+            nn.Dropout(0.15),
+
+            nn.Linear(32, 16),
+            nn.BatchNorm1d(16),
+            nn.GELU(),
+        )
+
+        # Fusion: 256 (visual) + 32 (pose) + 16 (iris) = 304
         self.fusion = nn.Sequential(
-            nn.Linear(128 + 32, 128),
+            nn.Linear(304, 128),
             nn.BatchNorm1d(128),
             nn.GELU(),
             nn.Dropout(0.4),
@@ -522,15 +580,20 @@ class NeuralNetworkModel(nn.Module):
             self.freeze_backbone()
 
     def forward(self, image, head):
+        # head: (B, 13) — split into pose (0:9) and iris (9:13)
+        pose = head[:, :9]
+        iris = head[:, 9:]
+
         x = self.backbone(image)
         x = self.pool(x).flatten(1)
         x = self.visual_fc(x)
 
-        h = self.pose_fc(head)
+        p = self.pose_fc(pose)
+        i = self.iris_fc(iris)
 
-        fused = torch.cat([x, h], dim=1)
+        fused = torch.cat([x, p, i], dim=1)
         return self.fusion(fused)
-    
+
     def freeze_backbone(self):
         for param in self.backbone.parameters():
             param.requires_grad = False

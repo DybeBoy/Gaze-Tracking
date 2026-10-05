@@ -11,38 +11,50 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 os.makedirs("saved_models", exist_ok=True)
 os.makedirs("saved_model_extra", exist_ok=True)
-saved_models = os.listdir("saved_models")
+saved_models = sorted(os.listdir("saved_models"))
+
+print("\nAvailable models:")
+if not saved_models:
+    print("  No saved models found. Train a model first.")
+    exit()
+for i, fname in enumerate(saved_models):
+    try:
+        extra = np.load(f"saved_model_extra/head_scale{i}.npy")
+        info = f"val loss: {float(extra[1]):.4f}  |  head scale: {float(extra[0]):.2f}"
+    except (FileNotFoundError, IndexError):
+        info = "no extra info"
+    print(f"  {i}: {fname}  |  {info}")
+print(f"  -: {saved_models[-1]} (latest)")
 
 model_num = ""
-
-print(f'\nGive the models index (0-{len(saved_models)-1}). Works from last using "-".')
 while True:
-    answer = input("Input: ")
+    answer = input("\nSelect model (index or - for latest): ").strip()
 
-    if answer == "fuck no":
-        print("ok")
-        exit()
+    if answer == "-":
+        model_num = len(saved_models) - 1
+        break
 
     try:
         answer = int(answer)
     except ValueError:
-        print("Invalid input.")
+        print("  Invalid input — enter a number or '-'.")
         continue
 
-    if answer > len(saved_models) - 1:
-        print("Invalid model index")
+    if answer > len(saved_models) - 1 or answer < -len(saved_models):
+        print(f"  Index out of range. Choose 0–{len(saved_models)-1} or '-'.")
         continue
 
     if answer < 0:
         model_num = len(saved_models) + answer
-    elif answer >= 0:
+    else:
         model_num = answer
     break
 
 try:
-    head_scale = float(np.load(f"saved_model_extra/head_scale{model_num}.npy")[0])
-    val_loss = float(np.load(f"saved_model_extra/head_scale{model_num}.npy")[1])
-    print(f"Loaded head scale: {head_scale}, Validation loss: {val_loss}")
+    extra = np.load(f"saved_model_extra/head_scale{model_num}.npy")
+    head_scale = float(extra[0])
+    val_loss = float(extra[1])
+    print(f"  Loaded model {model_num}: head scale = {head_scale:.2f}, val loss = {val_loss:.4f}")
 except FileNotFoundError:
     head_scale = 1.0
 
@@ -63,14 +75,25 @@ except FileNotFoundError:
 supported = np.load("webcam_resolutions.npy")
 fps = np.load("webcam_fps.npy")
 
-mp_face = mp.solutions.face_mesh
-face_mesh = mp_face.FaceMesh(refine_landmarks=True)
+_face_options = mp.tasks.vision.FaceLandmarkerOptions(
+    base_options=mp.tasks.BaseOptions(model_asset_path=FACE_LANDMARKER_MODEL_PATH),
+    running_mode=mp.tasks.vision.RunningMode.VIDEO,
+    num_faces=1
+)
+face_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(_face_options)
 cap = cv2.VideoCapture(0)
 
 print("\nSupported resolutions:")
 for i, (w, h) in enumerate(supported):
-    print(f" {i}: {w}x{h}, {fps[i]:.3f} FPS")
-answer = int(input("Select resolution index: "))
+    print(f"  {i}: {w}x{h}  ({fps[i]:.3f} FPS)")
+while True:
+    try: 
+        answer = int(input("Select resolution (index): "))
+        if 0 <= answer < len(supported):
+            break
+        print(f"  Please enter a number between 0 and {len(supported)-1}.")
+    except ValueError:
+        print("  Please enter a number.")
 
 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, supported[answer][0])
@@ -115,7 +138,7 @@ targets = []
 is_continuous = False
 last_capture_time = 0.0
 capture_interval = 0.12
-CALIB_SAMPLES_PER_POINT = 5
+CALIB_SAMPLES_PER_POINT = 10
 
 for (nx, ny) in calib_points:
     px, py = int((nx / 2 + 0.5) * width), int((ny / 2 + 0.5) * height)
@@ -131,7 +154,8 @@ for (nx, ny) in calib_points:
             continue
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = face_mesh.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        res = face_landmarker.detect_for_video(mp_image, int(time.time() * 1000))
 
         screen = frame.copy()
         cv2.circle(screen, (px, py), 15, (0, 255, 0), -1)
@@ -147,7 +171,7 @@ for (nx, ny) in calib_points:
             last_capture_time = 0.0
             #print(f"Continuous capture: {is_continuous}")
             continue
-        if key == 32 and res.multi_face_landmarks:
+        if key == 32 and res.face_landmarks:
                 force_single = True
         else:
             force_single = False
@@ -163,8 +187,7 @@ for (nx, ny) in calib_points:
 
         last_capture_time = now
 
-        landmarks = res.multi_face_landmarks[0].landmark
-        pred = gaze_prediction(model, frame, device, face_mesh)
+        pred = gaze_prediction(model, frame, device, face_landmarker)
 
         point_preds.append([pred["x"], pred["y"]])
         images += 1
@@ -206,7 +229,7 @@ try:
         if not ret:
             continue
         
-        gaze_data = gaze_prediction(model, frame, device, face_mesh)
+        gaze_data = gaze_prediction(model, frame, device, face_landmarker)
 
         if gaze_data is None:
             continue

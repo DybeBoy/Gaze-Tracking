@@ -16,26 +16,121 @@ except FileNotFoundError:
 supported = np.load("webcam_resolutions.npy")
 fps = np.load("webcam_fps.npy")
 
-mp_face = mp.solutions.face_mesh
-face_mesh = mp_face.FaceMesh(refine_landmarks=True)
+_face_options = mp.tasks.vision.FaceLandmarkerOptions(
+    base_options=mp.tasks.BaseOptions(model_asset_path=FACE_LANDMARKER_MODEL_PATH),
+    running_mode=mp.tasks.vision.RunningMode.VIDEO,
+    num_faces=1
+)
+face_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(_face_options)
 cap = cv2.VideoCapture(0)
 
+# --- Resolution selection ---
 print("\nSupported resolutions:")
 for i, (width, height) in enumerate(supported):
-    print(f" {i}: {width}x{height}, {fps[i]:.3f} FPS")
-answer = int(input("Select resolution index: "))
+    print(f"  {i}: {width}x{height}  ({fps[i]:.3f} FPS)")
+while True:
+    try:
+        answer = int(input("Select resolution (index): "))
+        if 0 <= answer < len(supported):
+            break
+        print(f"  Please enter a number between 0 and {len(supported)-1}.")
+    except ValueError:
+        print("  Please enter a number.")
 
 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, supported[answer][0])
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, supported[answer][1])
 cap.set(cv2.CAP_PROP_FPS, fps[answer])
 
-print("\nGive file location for the data")
-dataset_type = input("Input: ")
+# --- Dataset selection ---
+def _list_dir_sorted(path):
+    try:
+        return sorted(d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d)))
+    except FileNotFoundError:
+        return []
+
+def _session_sample_count(session_path):
+    npz = os.path.join(session_path, "data.npz")
+    try:
+        with np.load(npz, allow_pickle=True) as d:
+            return len(d["image_ids"])
+    except Exception:
+        return 0
+
+# Step A: dataset type
+print("\n--- Step 1: Dataset type ---")
+types = _list_dir_sorted("data")
+if types:
+    for i, t in enumerate(types):
+        print(f"  {i}: {t}")
+else:
+    print("  No dataset types found.")
+print(f"  {len(types)}: Create new type")
+
+while True:
+    raw = input("Select type (index or name): ").strip()
+    if not raw:
+        continue
+    try:
+        idx = int(raw)
+        if 0 <= idx < len(types):
+            dataset_type_name = types[idx]
+            break
+        elif idx == len(types):
+            dataset_type_name = input("  Enter new type name: ").strip()
+            if dataset_type_name:
+                break
+            print("  Name cannot be empty.")
+        else:
+            print(f"  Please enter a number between 0 and {len(types)}.")
+    except ValueError:
+        dataset_type_name = raw
+        break
+
+# Step B: session
+print(f"\n--- Step 2: Session in '{dataset_type_name}' ---")
+sessions = _list_dir_sorted(f"data/{dataset_type_name}")
+if sessions:
+    for i, s in enumerate(sessions):
+        count = _session_sample_count(f"data/{dataset_type_name}/{s}")
+        print(f"  {i}: {s}  ({count} samples)")
+else:
+    print("  No sessions found.")
+print(f"  {len(sessions)}: Create new session")
+
+while True:
+    raw = input("Select session (index or name): ").strip()
+    if not raw:
+        continue
+    try:
+        idx = int(raw)
+        if 0 <= idx < len(sessions):
+            session_name = sessions[idx]
+            break
+        elif idx == len(sessions):
+            default = f"sesh{len(sessions)+1}"
+            entered = input(f"  New session name (press Enter for '{default}'): ").strip()
+            session_name = entered if entered else default
+            break
+        else:
+            print(f"  Please enter a number between 0 and {len(sessions)}.")
+    except ValueError:
+        session_name = raw
+        break
+
+dataset_type = f"{dataset_type_name}/{session_name}"
 dataset = GazeDataset(root=f"data/{dataset_type}")
-print("\nGive the cutoff point")
-cutoff = int(input("Input: "))
-print("\n")
+
+# --- Cutoff ---
+while True:
+    try:
+        cutoff = int(input("\nMax samples per target point (0 = no limit): "))
+        if cutoff >= 0:
+            break
+        print("  Please enter 0 or a positive number.")
+    except ValueError:
+        print("  Please enter a number.")
+print()
 
 cv2.namedWindow("Frame", cv2.WND_PROP_FULLSCREEN)
 cv2.setWindowProperty("Frame", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -133,7 +228,7 @@ while True:
 
     if key != -1:
         # quit
-        if key in [27, ord('q'), ord('Q')]:
+        if key in [27]:
             break
         # left
         if key in LEFT_KEYS:
@@ -191,16 +286,17 @@ while True:
     key = cv2.waitKey(1)
 
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    res = face_mesh.process(rgb_frame)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    res = face_landmarker.detect_for_video(mp_image, int(time.time() * 1000))
 
     cv2.imshow("Frame", backround_frame)
 
-    if not res.multi_face_landmarks: 
+    if not res.face_landmarks:
         print("No face detected. Skipping frame.")
         continue
 
     # Reject detections where key landmarks are outside the frame (partially cropped face)
-    landmarks = res.multi_face_landmarks[0].landmark
+    landmarks = res.face_landmarks[0]
     key_ids = [33, 133, 362, 263, 1, 61, 291, 199]
     if any(not (0.0 <= landmarks[i].x <= 1.0 and 0.0 <= landmarks[i].y <= 1.0) for i in key_ids):
         print("Key landmarks outside frame bounds. Skipping frame.")

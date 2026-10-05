@@ -14,6 +14,7 @@ BATCH_SIZE = 64
 HEAD_ONLY_EPOCHS = 40
 PARTIAL_FREEZE_EPOCHS = 60
 FINE_TUNE_EPOCHS = 25
+EARLY_STOP_PATIENCE = 10
 
 def train_model(model, train_loader, val_loader, device, epochs, stage):
 
@@ -71,7 +72,6 @@ def train_model(model, train_loader, val_loader, device, epochs, stage):
 
     best_val_loss = float("inf")
     early_stop_counter = 0
-    early_stop_patience = 10
 
     for epoch in range(epochs):
 
@@ -158,7 +158,7 @@ def train_model(model, train_loader, val_loader, device, epochs, stage):
         else:
             early_stop_counter += 1
 
-        if early_stop_counter >= early_stop_patience:
+        if early_stop_counter >= EARLY_STOP_PATIENCE:
             print("Early stopping triggered.")
             break
 
@@ -169,11 +169,26 @@ def train_model(model, train_loader, val_loader, device, epochs, stage):
 
 
 def main():
+    # Disable PyTorch's expandable memory segments. On Blackwell GPUs in HMM
+    # mode (CoherentGPUMemoryMode=numa), expandable segments cause constant
+    # system RAM page remapping that interferes with other GPU processes.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
+
+    # Use file_system sharing strategy instead of /dev/shm semaphores.
+    # The default strategy leaks sem.mp-* files in /dev/shm when workers die
+    # unexpectedly, which corrupts IPC for other apps (Spotify, LibreWolf, etc).
+    torch.multiprocessing.set_sharing_strategy('file_system')
+
     start_time = time.time()
 
     best_val_loss = float("inf")
     try:
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+        # Reserve ~15% VRAM for other processes to avoid OOM errors
+        if torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(0.85)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
@@ -201,9 +216,10 @@ def main():
             batch_size=BATCH_SIZE,
             shuffle=True,
             num_workers=8,
-            pin_memory=True,
+            pin_memory=False,
             persistent_workers=True,
-            prefetch_factor=2
+            prefetch_factor=2,
+            multiprocessing_context='spawn'
         )
 
         print("\nValidation")
@@ -219,9 +235,10 @@ def main():
             batch_size=BATCH_SIZE,
             shuffle=False,
             num_workers=8,
-            pin_memory=True,
+            pin_memory=False,
             persistent_workers=True,
-            prefetch_factor=2
+            prefetch_factor=2,
+            multiprocessing_context='spawn'
         )
 
         print("\nStarting training...\n")

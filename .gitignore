@@ -7,7 +7,11 @@
 *.ckpt
 *.pb
 *.pth
-*npy
+*.npy
+*.toml
+*.task
+.python-version
+*.lock
 
 # Ignore folders with data
 data/
